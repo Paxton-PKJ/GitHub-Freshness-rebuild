@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub-Freshness-rebuild
 // @namespace    https://github.com/
-// @version      2.0.0
+// @version      2.0.1
 // @description  Highlight fresh GitHub repos and file trees with stable timestamps and GitHub API data.
 // @author       Paxton https://github.com/Paxton-PKJ/GitHub-Freshness-rebuild
 // @license      MIT
@@ -23,6 +23,7 @@
   'use strict'
 
   const STORAGE_KEY = 'github-freshness-config-v2'
+  const API_FALLBACK_PROMPT_KEY = 'github-freshness-api-fallback-v1'
   const LEGACY_THEME_KEY = 'config_JSON'
   const LEGACY_CURRENT_THEME_KEY = 'CURRENT_THEME'
   const LEGACY_TOKEN_KEY = 'AWESOME_TOKEN'
@@ -32,24 +33,29 @@
   const repoCache = new Map()
   let rateLimitAlertShown = false
   let awesomeObserver = null
+  let tokenPromptHandledThisPage = false
 
   const defaultTheme = {
     BGC: {
       highlightColor: 'rgba(15, 172, 83, 0.18)',
+      warningColor: 'rgba(210, 153, 34, 0.18)',
       greyColor: 'rgba(127, 127, 127, 0.10)',
       isEnabled: true,
     },
     TIME_BOUNDARY: {
       number: 30,
       select: 'day',
+      warningMultiplier: 2,
     },
     FONT: {
       highlightColor: 'rgb(9, 105, 218)',
+      warningColor: 'rgb(154, 103, 0)',
       greyColor: 'rgb(101, 109, 118)',
       isEnabled: true,
     },
     DIR: {
       highlightColor: 'rgb(31, 136, 61)',
+      warningColor: 'rgb(154, 103, 0)',
       greyColor: 'rgb(101, 109, 118)',
       isEnabled: true,
     },
@@ -98,12 +104,17 @@
       vertical-align: middle;
     }
 
-    .gfh-api-badge[data-fresh="true"] {
+    .gfh-api-badge[data-state="recent"] {
       border-color: rgba(31, 136, 61, 0.35);
       background: rgba(31, 136, 61, 0.12);
     }
 
-    .gfh-api-badge[data-fresh="false"] {
+    .gfh-api-badge[data-state="warning"] {
+      border-color: rgba(210, 153, 34, 0.35);
+      background: rgba(210, 153, 34, 0.12);
+    }
+
+    .gfh-api-badge[data-state="stale"] {
       border-color: rgba(101, 109, 118, 0.25);
       background: rgba(127, 127, 127, 0.10);
     }
@@ -212,6 +223,64 @@
     return `${year}-${month}-${day}`
   }
 
+  function normalizeGmtOffset(hours, minutes = '00') {
+    const numericHours = Number(hours)
+    if (Number.isNaN(numericHours)) {
+      return null
+    }
+
+    const sign = numericHours >= 0 ? '+' : '-'
+    const paddedHours = String(Math.abs(numericHours)).padStart(2, '0')
+    const paddedMinutes = String(minutes || '00').padStart(2, '0')
+    return `${sign}${paddedHours}:${paddedMinutes}`
+  }
+
+  function normalizeTimezoneInTitle(title) {
+    if (!title) {
+      return title
+    }
+
+    return title
+      .replace(/\s+/g, ' ')
+      .replace(/\b(?:GMT|UTC)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b/gi, (_, sign, hours, minutes) => {
+        const normalized = `${sign}${String(hours).padStart(2, '0')}:${String(
+          minutes || '00'
+        ).padStart(2, '0')}`
+        return normalized
+      })
+      .trim()
+  }
+
+  function parseFrontendDatetimeTitle(title) {
+    if (!title) {
+      return null
+    }
+
+    const normalizedTitle = normalizeTimezoneInTitle(title)
+
+    const nativeParsed = new Date(normalizedTitle)
+    if (!Number.isNaN(nativeParsed.getTime())) {
+      return nativeParsed.toISOString()
+    }
+
+    const zhMatch = title.match(
+      /^(\d{4})年(\d{1,2})月(\d{1,2})日\s+GMT([+-]?\d{1,2})(?::?(\d{2}))?\s+(\d{1,2}):(\d{2})$/
+    )
+    if (zhMatch) {
+      const [, year, month, day, offsetHours, offsetMinutes, hour, minute] = zhMatch
+      const offset = normalizeGmtOffset(offsetHours, offsetMinutes)
+      if (!offset) {
+        return null
+      }
+      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(
+        2,
+        '0'
+      )}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00${offset}`
+    }
+
+    return null
+  }
+
   function getBoundaryDays(boundary) {
     const count = Number(boundary.number) || 0
     switch (boundary.select) {
@@ -228,14 +297,37 @@
     }
   }
 
-  function isFresh(datetime, boundary) {
+  function getFreshnessState(datetime, boundary) {
     const input = new Date(datetime)
     if (Number.isNaN(input.getTime())) {
-      return false
+      return 'stale'
     }
-    const thresholdDate = new Date()
-    thresholdDate.setDate(thresholdDate.getDate() - getBoundaryDays(boundary))
-    return input >= thresholdDate
+
+    const primaryDays = getBoundaryDays(boundary)
+    const warningMultiplier = Math.max(2, Number(boundary.warningMultiplier) || 2)
+    const recentDate = new Date()
+    recentDate.setDate(recentDate.getDate() - primaryDays)
+
+    const warningDate = new Date()
+    warningDate.setDate(warningDate.getDate() - primaryDays * warningMultiplier)
+
+    if (input >= recentDate) {
+      return 'recent'
+    }
+    if (input >= warningDate) {
+      return 'warning'
+    }
+    return 'stale'
+  }
+
+  function resolveStateColor(configBlock, state) {
+    if (state === 'recent') {
+      return configBlock.highlightColor
+    }
+    if (state === 'warning') {
+      return configBlock.warningColor || configBlock.highlightColor
+    }
+    return configBlock.greyColor
   }
 
   function extractRepoInfo(href, exactOnly = false) {
@@ -326,7 +418,7 @@
     return repoCache.get(cacheKey)
   }
 
-  function setBackgroundColor(element, backgroundConfig, fresh) {
+  function setBackgroundColor(element, backgroundConfig, state) {
     if (!element) {
       return
     }
@@ -334,28 +426,28 @@
       element.style.removeProperty('background-color')
       return
     }
-    const color = fresh ? backgroundConfig.highlightColor : backgroundConfig.greyColor
+    const color = resolveStateColor(backgroundConfig, state)
     element.style.setProperty('background-color', color, 'important')
   }
 
-  function setTextColor(elements, textConfig, fresh) {
+  function setTextColor(elements, textConfig, state) {
     for (const element of elements.filter(Boolean)) {
       if (!textConfig.isEnabled) {
         element.style.removeProperty('color')
         continue
       }
-      element.style.setProperty('color', fresh ? textConfig.highlightColor : textConfig.greyColor, 'important')
+      element.style.setProperty('color', resolveStateColor(textConfig, state), 'important')
     }
   }
 
-  function setDirectoryColor(elements, dirConfig, fresh) {
+  function setDirectoryColor(elements, dirConfig, state) {
     for (const element of elements.filter(Boolean)) {
       if (!dirConfig.isEnabled) {
         element.style.removeProperty('color')
         element.style.removeProperty('fill')
         continue
       }
-      const color = fresh ? dirConfig.highlightColor : dirConfig.greyColor
+      const color = resolveStateColor(dirConfig, state)
       element.style.setProperty('color', color, 'important')
       element.style.setProperty('fill', color, 'important')
     }
@@ -447,7 +539,7 @@
           continue
         }
 
-        const fresh = isFresh(datetime, theme.TIME_BOUNDARY)
+        const freshnessState = getFreshnessState(datetime, theme.TIME_BOUNDARY)
         const timeCell = relativeTimeElement.closest('td') || row
         const textTargets = [
           relativeTimeElement.closest('a') || relativeTimeElement.parentElement,
@@ -460,9 +552,9 @@
           dirTargets.push(row.querySelector('.color-fg-muted'))
         }
 
-        setBackgroundColor(timeCell, theme.BGC, fresh)
-        setTextColor(textTargets, theme.FONT, fresh)
-        setDirectoryColor(dirTargets, theme.DIR, fresh)
+        setBackgroundColor(timeCell, theme.BGC, freshnessState)
+        setTextColor(textTargets, theme.FONT, freshnessState)
+        setDirectoryColor(dirTargets, theme.DIR, freshnessState)
         updateFormattedTime(relativeTimeElement, theme.TIME_FORMAT.isEnabled, datetime)
       }
 
@@ -478,7 +570,7 @@
           continue
         }
 
-        const fresh = isFresh(datetime, theme.TIME_BOUNDARY)
+        const freshnessState = getFreshnessState(datetime, theme.TIME_BOUNDARY)
         const backgroundTarget =
           row.querySelector('td[colspan]') ||
           row.querySelector('[data-testid="latest-commit"]') ||
@@ -491,8 +583,8 @@
           relativeTimeElement.closest('a') || relativeTimeElement.parentElement,
         ]
 
-        setBackgroundColor(backgroundTarget, theme.BGC, fresh)
-        setTextColor(textTargets, theme.FONT, fresh)
+        setBackgroundColor(backgroundTarget, theme.BGC, freshnessState)
+        setTextColor(textTargets, theme.FONT, freshnessState)
         updateFormattedTime(relativeTimeElement, theme.TIME_FORMAT.isEnabled, datetime)
       }
     }
@@ -518,21 +610,59 @@
         continue
       }
 
-      const key = `${repoInfo.fullName}::${getNodePath(anchor)}`
+      const container = findSearchResultContainer(anchor)
+      if (!container || !isSearchPrimaryAnchor(anchor, repoInfo)) {
+        continue
+      }
+
+      const key = `${repoInfo.fullName}::${getNodePath(container)}`
       if (entries.has(key)) {
         continue
       }
 
       entries.set(key, {
         anchor,
-        container:
-          anchor.closest('article, li, [data-testid="results-list"] > div, .Box-sc-g0xbh4-0') ||
-          anchor.parentElement,
+        container,
         repoInfo,
       })
     }
 
     return Array.from(entries.values())
+  }
+
+  function findSearchResultContainer(anchor) {
+    return (
+      anchor.closest('article') ||
+      anchor.closest('[data-testid="results-list"] > div') ||
+      anchor.closest('.Box-sc-g0xbh4-0')
+    )
+  }
+
+  function isSearchPrimaryAnchor(anchor, repoInfo) {
+    if (!anchor || !repoInfo) {
+      return false
+    }
+
+    if (anchor.closest('h1, h2, h3, h4')) {
+      return true
+    }
+
+    const text = (anchor.textContent || '').replace(/\s+/g, ' ').trim()
+    if (!text) {
+      return false
+    }
+
+    const normalizedText = text.replace(/\s+/g, '').toLowerCase()
+    const fullName = repoInfo.fullName.toLowerCase()
+    const compactFullName = fullName.replace(/\s+/g, '')
+    const repoName = repoInfo.repo.toLowerCase()
+
+    return (
+      normalizedText === compactFullName ||
+      normalizedText === fullName ||
+      normalizedText.endsWith(`/${repoName}`) ||
+      normalizedText === repoName
+    )
   }
 
   function getNodePath(node) {
@@ -548,7 +678,7 @@
     return parts.join('>')
   }
 
-  function upsertApiBadge(anchor, text, fresh) {
+  function upsertApiBadge(anchor, text, state) {
     const parent = anchor.parentElement
     if (!parent) {
       return
@@ -559,8 +689,70 @@
       badge.className = 'gfh-api-badge'
       parent.appendChild(badge)
     }
-    badge.dataset.fresh = String(fresh)
+    badge.dataset.state = state
     badge.textContent = text
+  }
+
+  function findFrontendDatetime(container) {
+    if (!container) {
+      return null
+    }
+
+    const directElement =
+      container.querySelector('relative-time[datetime]') ||
+      container.querySelector('time[datetime]') ||
+      container.querySelector('[datetime]')
+    if (directElement) {
+      return {
+        element: directElement,
+        datetime: directElement.getAttribute('datetime'),
+      }
+    }
+
+    const titleElement = Array.from(container.querySelectorAll('[title]')).find((element) =>
+      /\b(?:GMT|UTC)\s*[+-]?\s*\d{1,2}/i.test(element.getAttribute('title') || '')
+    )
+    if (!titleElement) {
+      return null
+    }
+
+    const datetime = parseFrontendDatetimeTitle(titleElement.getAttribute('title'))
+    if (!datetime) {
+      return null
+    }
+
+    return {
+      element: titleElement,
+      datetime,
+    }
+  }
+
+  function confirmApiFallback(message) {
+    const storedDecision = GM_getValue(API_FALLBACK_PROMPT_KEY, '')
+    if (storedDecision === 'allow') {
+      return true
+    }
+    if (storedDecision === 'deny') {
+      return false
+    }
+
+    const shouldUseApi = window.confirm(message)
+    GM_setValue(API_FALLBACK_PROMPT_KEY, shouldUseApi ? 'allow' : 'deny')
+    return shouldUseApi
+  }
+
+  function maybePromptForTokenForApi() {
+    if (tokenPromptHandledThisPage || config.token) {
+      return
+    }
+
+    tokenPromptHandledThisPage = true
+    const shouldConfigure = window.confirm(
+      '当前将通过 GitHub API 获取时间信息。\n\n未配置 Token 也能使用，但更容易遇到限流。\n\n是否现在配置 Token？'
+    )
+    if (shouldConfigure) {
+      configureToken()
+    }
   }
 
   async function processSearchPage(theme) {
@@ -569,14 +761,47 @@
       return
     }
 
+    const apiFallbackEntries = []
+
+    for (const { anchor, container, repoInfo } of entries) {
+      const frontendDatetime = findFrontendDatetime(container)
+      const datetimeElement = frontendDatetime?.element
+      const datetime = frontendDatetime?.datetime
+      if (!datetime) {
+        apiFallbackEntries.push({ anchor, container, repoInfo })
+        continue
+      }
+
+      const freshnessState = getFreshnessState(datetime, theme.TIME_BOUNDARY)
+      setBackgroundColor(container, theme.BGC, freshnessState)
+      setTextColor(
+        [anchor, datetimeElement.closest('a') || datetimeElement.parentElement],
+        theme.FONT,
+        freshnessState
+      )
+    }
+
+    if (!apiFallbackEntries.length) {
+      return
+    }
+
+    const shouldUseApi = confirmApiFallback(
+      '搜索页部分结果无法直接从前端读取更新时间。\n\n是否改为使用 GitHub API 获取这些结果的时间信息？'
+    )
+    if (!shouldUseApi) {
+      return
+    }
+
+    maybePromptForTokenForApi()
+
     await Promise.all(
-      entries.map(async ({ anchor, container, repoInfo }) => {
+      apiFallbackEntries.map(async ({ anchor, container, repoInfo }) => {
         try {
           const data = await fetchRepoData(repoInfo)
-          const fresh = isFresh(data.updated_at, theme.TIME_BOUNDARY)
-          setBackgroundColor(container, theme.BGC, fresh)
-          setTextColor([anchor], theme.FONT, fresh)
-          upsertApiBadge(anchor, `Updated ${formatDate(data.updated_at)}`, fresh)
+          const freshnessState = getFreshnessState(data.updated_at, theme.TIME_BOUNDARY)
+          setBackgroundColor(container, theme.BGC, freshnessState)
+          setTextColor([anchor], theme.FONT, freshnessState)
+          upsertApiBadge(anchor, `Updated ${formatDate(data.updated_at)}`, freshnessState)
         } catch (error) {
           console.warn(`GitHub-Freshness-rebuild: failed to load ${repoInfo.fullName}.`, error)
         }
@@ -618,10 +843,14 @@
     }
     try {
       const data = await fetchRepoData(repoInfo)
-      const fresh = isFresh(data.updated_at, theme.TIME_BOUNDARY)
-      setBackgroundColor(anchor, theme.BGC, fresh)
-      setTextColor([anchor], theme.FONT, fresh)
-      upsertApiBadge(anchor, `★ ${data.stargazers_count} · ${formatDate(data.updated_at)}`, fresh)
+      const freshnessState = getFreshnessState(data.updated_at, theme.TIME_BOUNDARY)
+      setBackgroundColor(anchor, theme.BGC, freshnessState)
+      setTextColor([anchor], theme.FONT, freshnessState)
+      upsertApiBadge(
+        anchor,
+        `★ ${data.stargazers_count} · ${formatDate(data.updated_at)}`,
+        freshnessState
+      )
     } catch (error) {
       console.warn(`GitHub-Freshness-rebuild: failed to load ${repoInfo.fullName}.`, error)
     }
@@ -636,6 +865,15 @@
     if (!anchors.length) {
       return
     }
+
+    const shouldUseApi = confirmApiFallback(
+      'Awesome 列表通常不直接提供仓库更新时间和星标数。\n\n是否使用 GitHub API 获取这些信息？'
+    )
+    if (!shouldUseApi) {
+      return
+    }
+
+    maybePromptForTokenForApi()
 
     if (awesomeObserver) {
       awesomeObserver.disconnect()
@@ -670,6 +908,7 @@
 
   async function run() {
     config = loadConfig()
+    tokenPromptHandledThisPage = false
     const theme = getActiveThemeConfig()
 
     if (window.location.pathname === SEARCH_PATHNAME) {
@@ -750,6 +989,29 @@
     updateThemeSetting(activeThemeName, (theme) => {
       theme.TIME_BOUNDARY.number = Number(match[1])
       theme.TIME_BOUNDARY.select = match[2].toLowerCase()
+      return theme
+    })
+  }
+
+  function configureWarningMultiplier() {
+    const activeThemeName = getEffectiveThemeName()
+    const current = config.themes[activeThemeName].TIME_BOUNDARY.warningMultiplier || 2
+    const value = promptForValue(
+      '设置黄色区间倍数。示例：2 表示“阈值到 2 倍阈值”为黄色。',
+      String(current)
+    )
+    if (value === null) {
+      return
+    }
+
+    const normalized = Number(value.trim())
+    if (!Number.isFinite(normalized) || normalized <= 1) {
+      window.alert('黄色区间倍数必须大于 1。示例：2')
+      return
+    }
+
+    updateThemeSetting(activeThemeName, (theme) => {
+      theme.TIME_BOUNDARY.warningMultiplier = normalized
       return theme
     })
   }
@@ -843,31 +1105,23 @@
       return
     }
     config = clone(defaultConfig)
+    GM_setValue(API_FALLBACK_PROMPT_KEY, '')
     saveConfig()
     refreshNow()
   }
 
   function registerMenuCommands() {
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 立即刷新', refreshNow)
-    GM_registerMenuCommand(
-      `GitHub-Freshness-rebuild: 主题模式 (${config.currentTheme})`,
-      configureCurrentThemeMode
-    )
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 当前主题时间阈值', configureThreshold)
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 当前主题排序', configureSort)
-    GM_registerMenuCommand(
-      'GitHub-Freshness-rebuild: 当前主题时间格式化',
-      configureTimeFormat
-    )
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 当前主题 Awesome 模式', configureAwesome)
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: GitHub Token', configureToken)
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 编辑浅色主题 JSON', () =>
-      editThemeJson('light')
-    )
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 编辑深色主题 JSON', () =>
-      editThemeJson('dark')
-    )
-    GM_registerMenuCommand('GitHub-Freshness-rebuild: 重置配置', resetConfig)
+    GM_registerMenuCommand('立即刷新', refreshNow)
+    GM_registerMenuCommand(`主题模式 (${config.currentTheme})`, configureCurrentThemeMode)
+    GM_registerMenuCommand('当前主题时间阈值', configureThreshold)
+    GM_registerMenuCommand('黄色区间倍数', configureWarningMultiplier)
+    GM_registerMenuCommand('当前主题排序', configureSort)
+    GM_registerMenuCommand('当前主题时间格式化', configureTimeFormat)
+    GM_registerMenuCommand('当前主题 Awesome 模式', configureAwesome)
+    GM_registerMenuCommand('GitHub Token', configureToken)
+    GM_registerMenuCommand('编辑浅色主题 JSON', () => editThemeJson('light'))
+    GM_registerMenuCommand('编辑深色主题 JSON', () => editThemeJson('dark'))
+    GM_registerMenuCommand('重置配置', resetConfig)
   }
 
   function attachNavigationListeners() {
